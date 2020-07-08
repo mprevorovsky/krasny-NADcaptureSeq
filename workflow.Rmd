@@ -1,0 +1,381 @@
+---
+title: NAD captureSeq
+output: html_document
+---
+
+The goal of the project is to identify *Mycobacterium smegmatis* transcripts capped with NAD.
+
+NAD captureSeq protocol info: https://www.nature.com/articles/nprot.2016.163
+
+Initial dataset from 29. 3. 2019 consists of 12 libraries.
+
+Design:
+
+WT cells
+
+* 3 biological replicates from EXPonential phase
+* 3 biological replicates from STATionary phase
+
+For each culture, an ADPRC-treated and mock-treated samples are available
+
+The goal is to find transcripts enriched in the ADPRC-treated libraries compared to the mock controls.
+
+Library fragment structure:
+
+* 5' adapter
+* a short initial G-stretch (to be removed)
+* actual cDNA (starting from the 5' cap)
+* UMI (7mer CNNNNNN)
+* 3' adapter with index
+
+read length = 58 nt (often not enough to reach the UMI)
+
+| sample | ADPRC | index |
+| ------ | ----- | ----- |
+| 1E     |+      | 1     |
+| 1E     |-      | 2     |
+| 2E     |+      | 3     |
+| 2E     |-      | 4     |
+| 3E     |+      | 5     |
+| 3E     |-      | 6     |
+| 1S     |+      | 7     |
+| 1S     |-      | 8     |
+| 2S     |+      | 9     |
+| 2S     |-      | 10    |
+| 3S     |+      | 11    |
+| 3S     |-      | 12    |
+
+***
+
+Initial quality checks (fastQC, mapping with HISAT2):
+
+* large adapter contamination
+* two populations of reads with different GC content (~43%, ~60%)
+* large sequence duplication
+* adapter-trimmed reads showed very low mappability (<1%)
+
+***
+
+```{bash}
+clumpify.sh --version
+cutadapt --version
+```
+
+```{bash, eval=FALSE}
+#Prepare required folders
+
+fastq_dir="./FASTQ/"
+fastq_collapse_dir="./FASTQ_UMIcollapsed/"
+fastq_trim_dir="./FASTQ_trimmed/"
+bam_dir="./BAM/"
+mkdir -p "${fastq_collapse_dir}"
+mkdir -p "${fastq_trim_dir}"
+mkdir -p "${bam_dir}"
+
+#Remove suspected PCR duplicates
+#
+#Mean library fragment size was ~400 bp. This means that UMI was likely not reached in the majority of reads, and cannot be used for deduplication.
+#Therefore, all identical reads were simply collapsed to 1 copy (this removed the vast majority of reads = library had very low complexity).
+#
+#The procedure uses the `clumpify.sh` script from the BBMap package.
+#
+#https://github.com/BioInfoTools/BBMap
+#
+#https://github.com/BioInfoTools/BBMap/blob/master/sh/clumpify.sh
+
+for i in `ls ${fastq_dir} | grep txt.gz`;
+do
+    clumpify.sh in="${fastq_dir}${i}" out="${fastq_collapse_dir}${i}.dedupe.gz" dedupe=t optical=f;
+done
+
+#Remove adapters using `trimmomatic`
+
+for i in `ls ${fastq_collapse_dir} | grep $"dedupe.gz"`;
+do
+    java -jar /opt/Trimmomatic-0.39/trimmomatic-0.39.jar SE -phred33 \
+        "${fastq_collapse_dir}${i}" "${fastq_trim_dir}${i}.trimmomatic" \
+        ILLUMINACLIP:/opt/Trimmomatic-0.39/adapters/TruSeq3-SE.fa:2:30:10;
+done
+
+for i in `ls ${fastq_trim_dir} | grep $"trimmomatic"`;
+do
+    gzip "${fastq_trim_dir}${i}" "${fastq_trim_dir}${i}.gz"
+done
+
+#Collapse the leading G-stretch of variable length to a single G using `UrQt.1.0.18`
+#
+#https://github.com/l-modolo/UrQt
+
+for i in `ls ${fastq_trim_dir} | grep $"trimmomatic.gz"`;
+do
+    /opt/UrQt/UrQt --in "${fastq_trim_dir}${i}" --out "${fastq_trim_dir}${i}.UrQt.fastq.gz" --pos head --N G --t 2 --m 4 --gz
+done
+
+#Perform final trimming with `cutadapt`
+#
+#* remove the leading single G
+#* remove the potential UMI tail (= last 7 nt)
+#* discard reads shorter than 20 nt
+
+for i in `ls ${fastq_trim_dir} | grep $"UrQt.fastq.gz"`;
+do
+    cutadapt --cut=-7 --cut=1 --minimum-length=20 -o "${fastq_trim_dir}${i}.cutadapt" "${fastq_trim_dir}${i}"
+done
+
+for i in `ls ${fastq_trim_dir} | grep $"cutadapt"`;
+do
+    gzip "${fastq_trim_dir}${i}" "${fastq_trim_dir}${i}.gz"
+done
+
+#Map clean reads into *M. smegmatis* genome (https://www.ncbi.nlm.nih.gov/nuccore/NC_008596) using HISAT2 and samtoools.
+#
+#Note: The genome also contains the sequences of recombinase and kanamycin resistance marker used for Ms1 knock-out generation, but these are not relevant for this project.
+
+maplog_file="./mapping.log"
+Q=10     # mapping quality score threshold for keeping reads in final BAM files
+CPU=4   # number of available CPUs
+HISAT2_index="./genome/M_smegmatisMC2_155_plus_recombinase"
+rm -f "${maplog_file}" # clean log file
+for i in `ls ${fastq_trim_dir} | grep $"cutadapt.gz"`;
+do
+	infile="${fastq_trim_dir}${i}"
+	outfile="${bam_dir}${i}.bam"
+	echo "############################################" >> "${maplog_file}" 2>&1
+	date >> "${maplog_file}" 2>&1
+	echo "HISAT2 processing file: ${infile}" >> "${maplog_file}" 2>&1
+	echo "############################################" >> "${maplog_file}" 2>&1
+	hisat2 -x "${HISAT2_index}" -U "${infile}" --threads "${CPU}" --rna-strandness F --summary-file "${outfile}.log" --no-spliced-alignment | samtools view -b -q "${Q}" --threads "${CPU}" - | samtools sort -o "${outfile}" - >> "${maplog_file}" 2>&1
+	samtools index "${outfile}" >> "${maplog_file}" 2>&1
+	samtools flagstat "${outfile}" >> "${maplog_file}" 2>&1
+	echo >> "${maplog_file}" 2>&1
+    echo
+done
+```
+
+Mappability was still very low (typically thousands/tens of thousands of reads per sample) but visual inspection in IGV suggested there are promising candidate loci with narrow pileups at the transcription start sites.
+
+* corresponding ORFs are typically short (300-400 bp)
+* at some loci (tRNA, rRNA) there are pileups in all samples (= including mock controls); at other loci pileups are specific for ADPRC-treated samples
+* some putative candidates do not contain pileups in one or two samples, which is likely a stochastic event due to very low read coverage
+
+***
+
+Many read pileups are in intergenic/non-ORF regions (= not covered by ORF annotation). To be able to quantitatively capture all such pileups, a version of genome annotation is needed that would cover the whole genome (=ORFs & "intergenic regions").
+Note: the original NCBI GFF file was appended to include Ms1 and rnpB features
+
+```{r, echo=FALSE}
+# https://stat.ethz.ch/pipermail/bioconductor/2008-October/024669.html
+getAttributeField <- function (x, field, attrsep = ";") {
+  s = strsplit(x, split = attrsep, fixed = TRUE)
+  sapply(s, function(atts) {
+    a = strsplit(atts, split = "=", fixed = TRUE)
+    m = match(field, sapply(a, "[", 1))
+    if (!is.na(m)) {
+      rv = a[[m]][2]
+    }
+    else {
+      rv = as.character(NA)
+    }
+    return(rv)
+  })
+}
+
+gffRead <- function(gffFile, nrows = -1) {
+  cat("Reading ", gffFile, ": ", sep="")
+  gff = read.table(gffFile, sep="\t", as.is=TRUE, quote="",
+                   header=FALSE, comment.char="#", nrows = nrows,
+                   colClasses=c("character", "character", "character", "integer",  
+                                "integer",
+                                "character", "character", "character", "character"))
+  colnames(gff) = c("seqname", "source", "feature", "start", "end",
+                    "score", "strand", "frame", "attributes")
+  cat("found", nrow(gff), "rows with classes:",
+      paste(sapply(gff, class), collapse=", "), "\n")
+  stopifnot(!any(is.na(gff$start)), !any(is.na(gff$end)))
+  return(gff)
+}
+```
+
+```{r}
+gff_all <- './genome/GCF_000015005.1_ASM1500v1_genomic_Ms1_rnpB.gff'
+gff_genes <- './genome/GCF_000015005.1_ASM1500v1_genomic_Ms1_rnpB.genes.gff'
+
+gff <- gffRead(gff_all)
+gff <- gff[gff$feature == 'gene',]
+gff <- gff[order(gff$start), ]
+gff_header <- grep(pattern = '#', readLines(gff_all), value = TRUE)
+writeLines(gff_header, gff_genes)
+write.table(gff, gff_genes, append = TRUE, sep = '\t', quote = FALSE, col.names = FALSE, row.names = FALSE)
+```
+
+```{bash}
+GFF_genes="./genome/GCF_000015005.1_ASM1500v1_genomic_Ms1_rnpB.genes.gff"
+GFF_intergenic="./genome/GCF_000015005.1_ASM1500v1_genomic_Ms1_rnpB.intergenic.gff"
+genome="./genome/genome.size"
+bedtools --version
+bedtools complement -i "${GFF_genes}" -g "${genome}" > "${GFF_intergenic}"
+```
+
+```{r}
+gff_intergenic <- './genome/GCF_000015005.1_ASM1500v1_genomic_Ms1_rnpB.intergenic.gff'
+gff_genes_inter <- './genome/GCF_000015005.1_ASM1500v1_genomic_Ms1_rnpB.genes+intergenic.gff'
+
+intergenic <- read.delim(gff_intergenic, comment.char = '#', header = FALSE, stringsAsFactors = FALSE)
+intergenic <- as.data.frame(cbind(intergenic[, 1], 'RefSeq', 'gene', intergenic[, 2], intergenic[, 3], '.', '*', '.', NA), stringsAsFactors = FALSE)
+colnames(intergenic) <- colnames(gff)
+intergenic$start <- as.numeric(intergenic$start) + 1
+intergenic$end <- as.numeric(intergenic$end)
+gff <- rbind(gff, intergenic)
+gff <- gff[order(gff$start), ]
+gff$Name <- getAttributeField(gff$attributes, 'Name')
+for(i in 1:nrow(gff)) {
+  if(is.na(gff[i, 'Name'])){
+    gff[i, 'attributes'] <- paste('Name=intergenic', gff[i-1, 'Name'], gff[i + 1, 'Name'], sep = '_')
+  }
+}
+gff <- gff[, 1:9]
+gff$Name <- getAttributeField(gff$attributes, 'Name')
+gff$Gene_ID <- getAttributeField(gff$attributes, 'locus_tag')
+
+writeLines(gff_header, gff_genes_inter)
+write.table(gff[, -10], gff_genes_inter, append = TRUE, sep = '\t', quote = FALSE, col.names = FALSE, row.names = FALSE)
+
+## sanity check
+#tmp <- NA
+#for(i in 2:nrow(gff)) {
+#  tmp <- c(tmp, gff[i, "start"] - gff[i - 1, "end"])
+#}
+#gff[which(tmp == max(tmp, na.rm = T)) - 2, ]
+#gff[which(tmp == max(tmp, na.rm = T)) - 1, ]
+```
+
+***
+
+Create count table for identification of read enrichment
+
+```{r, echo=FALSE, include=FALSE}
+library(GenomicAlignments)
+library(GenomicFeatures)
+```
+
+```{r}
+bam <- BamFileList(list.files('./BAM/', 
+                              pattern = '\\.bam$', 
+                              full.names = TRUE),
+                   asMates = FALSE,
+                   yieldSize = 1000000)
+
+gene_features <- GRanges(seqnames = 'gi|118467340|ref|NC_008596.1|', 
+                         ranges = IRanges(start = gff$start, end = gff$end), 
+                         strand = gff$strand)
+
+se <- summarizeOverlaps(features = gene_features,
+                        reads = bam,
+                        mode = 'Union',
+                        singleEnd = TRUE,
+                        ignore.strand = FALSE)
+sampleInfo <- data.frame(t(read.csv('sampleInfo', sep = '\t', header = FALSE)))
+colnames(sampleInfo) <- c('run', 'treatment', 'file', 'phase')
+colData(se) <- cbind(colData(se), sampleInfo) # must use cbind; direct assignment ('=') does not work
+colnames(se) <- paste(se$treatment, se$phase, se$run, sep = '_')
+rownames(se) <- gff$Name
+
+counts <- assay(se)
+counts <- counts[, sort(colnames(counts))]
+rownames(counts) <- gff$Name
+write.csv(counts, file = 'counts.txt', quote = FALSE)
+save(file = 'se.rda', se)
+
+colSums(counts)
+```
+
+Total counted reads per sample (`colSums(counts)`) compared with mapping statistics for each sample → looks OK
+
+***
+
+Identify regions with significantly enriched read coverage using DESeq2
+
+```{r, echo=FALSE, include=FALSE}
+library(DESeq2)
+library(RColorBrewer)
+library(gplots)
+```
+
+```{r}
+# Benjamini-Hochberg p value adjustment (FDR)
+padj.threshold <- 0.05 
+
+# sample QC
+ddsFull <- DESeqDataSet(se, design = ~ run + phase + treatment) # IMPORTANT !!! the experimental variable must be last, control variables first
+ddsFull <- DESeq(ddsFull)
+rld <- rlog(ddsFull)
+sampleDist <- dist(t(assay(rld)))
+sampleDistMatrix <- as.matrix(sampleDist)
+rownames(sampleDistMatrix) <- paste(rld$treatment, rld$phase, rld$run, sep = '_')
+colnames(sampleDistMatrix) <- NULL
+colours <- colorRampPalette(rev(brewer.pal(9, 'Blues')))(255)
+heatmap.2(sampleDistMatrix, trace = 'none', col = colours, cexRow = 0.6)
+ramp <- 1:3/3
+cols <- c(rgb(ramp, 0, 0), rgb(0, ramp, 0), rgb(0, 0, ramp))
+print(plotPCA(rld, intgroup = c('treatment', 'phase', 'run')))
+
+# DEG identification
+# EXPonential phase, ADPRC-treated vs mock
+ddsExp <- DESeqDataSet(se, design = ~ run + treatment)
+ddsExp <- ddsExp[, ddsExp$phase == 'EXP'] # remove samples from unwanted growth phases
+ddsExp$phase <- droplevels(ddsExp$phase)
+ddsExp$treatment <- relevel(ddsExp$treatment, 'mock') # change order of factor levels to get ADPRC/mock fold change
+ddsExp <- DESeq(ddsExp)
+resExp <- results(ddsExp)
+write.csv(resExp, file = 'DESeq2results_EXP.txt', quote = FALSE)
+resExp.sig <- resExp[which(resExp$padj < padj.threshold), ]
+resExp.sig <- resExp.sig[order(resExp.sig$log2FoldChange), ]
+write.csv(resExp.sig, file = 'DESeq2results_EXP.SIG.txt', quote = FALSE)
+
+# STATonential phase, ADPRC-treated vs mock
+ddsStat <- DESeqDataSet(se, design = ~ run + treatment)
+ddsStat <- ddsStat[, ddsStat$phase == 'STAT'] # remove samples from unwanted growth phases
+ddsStat$phase <- droplevels(ddsStat$phase)
+ddsStat$treatment <- relevel(ddsStat$treatment, 'mock') # change order of factor levels to get ADPRC/mock fold change
+ddsStat <- DESeq(ddsStat)
+resStat <- results(ddsStat)
+write.csv(resStat, file = 'DESeq2results_STAT.txt', quote = FALSE)
+resStat.sig <- resStat[which(resStat$padj < padj.threshold), ]
+resStat.sig <- resStat.sig[order(resStat.sig$log2FoldChange), ]
+write.csv(resStat.sig, file = 'DESeq2results_STAT.SIG.txt', quote = FALSE)
+```
+
+DESeq2 returned only few DEGs for the exponential phase and no DEGs for the stationary phase. Moreover, most "DEGs" seem to contain reads in both ADPRC-treated and mock controls (but enriched in ADPRC-treated samples).
+Apparently, DESeq2 is not suitable for this very-low-coverage dataset. The tools cannot build its statistical models when counts are close to zero, so most genes cannot be analyzed with DESeq2.
+
+Therefore, a less sophisticated approach was used:
+
+* for each sample, respective gene counts were normalized to the total number of counts in the sample (and multiplied by 10^6; `counts.lib_norm`)
+* library-normalized counts from the three biological repeats were pooled (i.e., added together; `counts.lib_norm.pool`)
+* exponential (EXP)- and stationary (STAT)-phase pooled library-normalized counts were further normalized to the corresponding mock-treated control (`counts.lib_norm.pool.ctrl_norm`)
+
+```{r}
+counts.lib_norm <- counts
+for (i in 1:ncol(counts)){
+  counts.lib_norm[, i] <- counts[, i] / colSums(counts)[i] * 1000000
+}
+counts.lib_norm.pool <- cbind(rowSums(counts.lib_norm[, 1:3]), 
+                              rowSums(counts.lib_norm[, 4:6]), 
+                              rowSums(counts.lib_norm[, 7:9]),
+                              rowSums(counts.lib_norm[, 10:12]))
+colnames(counts.lib_norm.pool) <- c('ADPRC_EXP', 'ADPRC_STAT', 'mock_EXP', 'mock_STAT')
+counts.lib_norm.pool.ctrl_norm <- cbind(counts.lib_norm.pool[, 1] / counts.lib_norm.pool[, 3],
+                                        counts.lib_norm.pool[, 2] / counts.lib_norm.pool[, 4])
+colnames(counts.lib_norm.pool.ctrl_norm) <- c('EXP', 'STAT')
+write.csv(counts.lib_norm, file = 'counts.lib_norm.txt', quote = FALSE)
+write.csv(counts.lib_norm.pool, file = 'counts.lib_norm.pool.txt', quote = FALSE)
+write.csv(counts.lib_norm.pool.ctrl_norm, file = 'counts.lib_norm.pool.ctrl_norm.txt', quote = FALSE)
+```
+
+Upon visual inspection in IGV of top candidates (highest values in `counts.lib_norm.pool.ctrl_norm`) the approach seems to be useful, though certainly not perfect (it is sensitive to outlier samples with high read counts for a given gene).
+
+***
+
+```{r}
+sessionInfo()
+```
