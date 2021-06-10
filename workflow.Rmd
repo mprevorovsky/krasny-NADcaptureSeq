@@ -354,10 +354,25 @@ Therefore, a less sophisticated approach was used:
 * library-normalized counts from the three biological repeats were pooled (i.e., added together; `counts.lib_norm.pool`)
 * exponential (EXP)- and stationary (STAT)-phase pooled library-normalized counts were further normalized to the corresponding mock-treated control (`counts.lib_norm.pool.ctrl_norm`)
 
+```{bash, eval=TRUE}
+bam_dir="./BAM/"
+stat_file="mapped_stats"
+rm -f "${stat_file}"
+for i in `ls "${bam_dir}" | grep \.bam$`
+do
+  printf "${i}\t" >> "${stat_file}"
+  samtools view -c "${bam_dir}${i}" >> "${stat_file}"
+done
+```
+
 ```{r}
+mapped_stats <- read.delim('mapped_stats', stringsAsFactors = FALSE, header = FALSE, sep = '\t')
+mapped_stats[, 3] <- colnames(se)
+mapped_stats <- mapped_stats[order(mapped_stats[, 3]), ]
+
 counts.lib_norm <- counts
 for (i in 1:ncol(counts)){
-  counts.lib_norm[, i] <- counts[, i] / colSums(counts)[i] * 1000000
+  counts.lib_norm[, i] <- counts[, i] / mapped_stats[i, 2] * 1000000
 }
 counts.lib_norm.pool <- cbind(rowSums(counts.lib_norm[, 1:3]), 
                               rowSums(counts.lib_norm[, 4:6]), 
@@ -373,6 +388,34 @@ write.csv(counts.lib_norm.pool.ctrl_norm, file = 'counts.lib_norm.pool.ctrl_norm
 ```
 
 Upon visual inspection in IGV of top candidates (highest values in `counts.lib_norm.pool.ctrl_norm`) the approach seems to be useful, though certainly not perfect (it is sensitive to outlier samples with high read counts for a given gene).
+
+
+We finally decided to use the following criteria to define NAD-capped RNAs:
+- at least 20 raw counts in 2+ biological replicates of ADPRC-treated samples, either growth condition
+- at least 3-fold mean normalized count enrichment of ADPRC-treated over mock-treated.
+
+```{r, eval=TRUE}
+threshold_counts <- 20
+threshold_samples <- 2
+threshold_enrichment <- 3
+
+counts.test <- counts[, 1:6] >= threshold_counts
+counts.pool.test <- cbind(EXP = rowSums(counts.test[, 1:3]), STAT = rowSums(counts.test[, 4:6]))
+
+exp <- rownames(counts.pool.test[counts.pool.test[, 1] >= threshold_samples 
+                                 & counts.lib_norm.pool.ctrl_norm[, 1] >= threshold_enrichment, ])
+write.csv(counts[rownames(counts) %in% exp, ], 
+          file = 'candidates_EXP.counts.txt', quote = FALSE)
+write.csv(counts.lib_norm.pool.ctrl_norm[rownames(counts) %in% exp, ], 
+          file = 'candidates_EXP.enrichment.txt', quote = FALSE)
+
+stat <- rownames(counts.pool.test[counts.pool.test[, 2] >= threshold_samples 
+                                 & counts.lib_norm.pool.ctrl_norm[, 2] >= threshold_enrichment, ])
+write.csv(counts[rownames(counts) %in% stat, ], 
+          file = 'candidates_STAT.counts.txt', quote = FALSE)
+write.csv(counts.lib_norm.pool.ctrl_norm[rownames(counts) %in% stat, ], 
+          file = 'candidates_STAT.enrichment.txt', quote = FALSE)
+```
 
 ***
 
