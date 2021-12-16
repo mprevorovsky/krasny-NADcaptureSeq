@@ -365,57 +365,9 @@ do
 done
 ```
 
-```{r}
-mapped_stats <- read.delim('mapped_stats', stringsAsFactors = FALSE, header = FALSE, sep = '\t')
-mapped_stats[, 3] <- colnames(se)
-mapped_stats <- mapped_stats[order(mapped_stats[, 3]), ]
-
-counts.lib_norm <- counts
-for (i in 1:ncol(counts)){
-  counts.lib_norm[, i] <- counts[, i] / mapped_stats[i, 2] * 1000000
-}
-counts.lib_norm.pool <- cbind(rowSums(counts.lib_norm[, 1:3]), 
-                              rowSums(counts.lib_norm[, 4:6]), 
-                              rowSums(counts.lib_norm[, 7:9]),
-                              rowSums(counts.lib_norm[, 10:12]))
-colnames(counts.lib_norm.pool) <- c('ADPRC_EXP', 'ADPRC_STAT', 'mock_EXP', 'mock_STAT')
-counts.lib_norm.pool.ctrl_norm <- cbind(counts.lib_norm.pool[, 1] / counts.lib_norm.pool[, 3],
-                                        counts.lib_norm.pool[, 2] / counts.lib_norm.pool[, 4])
-colnames(counts.lib_norm.pool.ctrl_norm) <- c('EXP', 'STAT')
-write.csv(counts.lib_norm, file = 'counts.lib_norm.txt', quote = FALSE)
-write.csv(counts.lib_norm.pool, file = 'counts.lib_norm.pool.txt', quote = FALSE)
-write.csv(counts.lib_norm.pool.ctrl_norm, file = 'counts.lib_norm.pool.ctrl_norm.txt', quote = FALSE)
-```
-
-Upon visual inspection in IGV of top candidates (highest values in `counts.lib_norm.pool.ctrl_norm`) the approach seems to be useful, though certainly not perfect (it is sensitive to outlier samples with high read counts for a given gene).
-
-
 We finally decided to use the following criteria to define NAD-capped RNAs:
 - at least 20 raw counts in 2+ biological replicates of ADPRC-treated samples, either growth condition
 - at least 3-fold mean normalized count enrichment of ADPRC-treated over mock-treated.
-
-```{r, eval=TRUE}
-threshold_counts <- 20
-threshold_samples <- 2
-threshold_enrichment <- 3
-
-counts.test <- counts[, 1:6] >= threshold_counts
-counts.pool.test <- cbind(EXP = rowSums(counts.test[, 1:3]), STAT = rowSums(counts.test[, 4:6]))
-
-exp <- rownames(counts.pool.test[counts.pool.test[, 1] >= threshold_samples 
-                                 & counts.lib_norm.pool.ctrl_norm[, 1] >= threshold_enrichment, ])
-write.csv(counts[rownames(counts) %in% exp, ], 
-          file = 'candidates_EXP.counts.txt', quote = FALSE)
-write.csv(counts.lib_norm.pool.ctrl_norm[rownames(counts) %in% exp, ], 
-          file = 'candidates_EXP.enrichment.txt', quote = FALSE)
-
-stat <- rownames(counts.pool.test[counts.pool.test[, 2] >= threshold_samples 
-                                 & counts.lib_norm.pool.ctrl_norm[, 2] >= threshold_enrichment, ])
-write.csv(counts[rownames(counts) %in% stat, ], 
-          file = 'candidates_STAT.counts.txt', quote = FALSE)
-write.csv(counts.lib_norm.pool.ctrl_norm[rownames(counts) %in% stat, ], 
-          file = 'candidates_STAT.enrichment.txt', quote = FALSE)
-```
 
 Since some transcripts (such as the very abundant Ms1) show substantial coverage only in the gene body (even in mock-treated samples), without corresponding coverage around their TSS, this looks like non-specific interaction between mRNA fragments and beads. Therefore, we decided to add one more filtering step: we will only consider coverage in the 30 nt region downstream of TSS (as defined in Li et al. 2017, DOI: 10.3389/fmicb.2017.02505). 
 
@@ -440,30 +392,7 @@ bed[bed[, 6] == '-', 3] <- bed[bed[, 6] == '-', 2]
 bed[bed[, 6] == '-', 2] <- as.numeric(bed[bed[, 6] == '-', 3]) - TSS_window - 1
 write.table(bed, paste0(genome_dir, 'TSS_Li.bed'), 
             row.names = FALSE, col.names = FALSE, quote = FALSE, sep = '\t')
-
-
-
-gff.ms1 <- import.gff3('./genome/Ms1.gff')
-
-bam <- BamFileList(list.files('./BAM/', 
-                              pattern = '\\.bam$', 
-                              full.names = TRUE),
-                   asMates = FALSE,
-                   yieldSize = 1000000)
-se <- summarizeOverlaps(features = gff.ms1,
-                        reads = bam,
-                        mode = 'Union',
-                        singleEnd = TRUE,
-                        ignore.strand = FALSE)
-sampleInfo <- data.frame(t(read.csv('sampleInfo', sep = '\t', header = FALSE)))
-colnames(sampleInfo) <- c('run', 'treatment', 'file', 'phase')
-colData(se) <- cbind(colData(se), sampleInfo) # must use cbind; direct assignment ('=') does not work
-colnames(se) <- paste(se$treatment, se$phase, se$run, sep = '_')
-counts <- assay(se)
-counts <- counts[, sort(colnames(counts))]
 ```
-
-
 
 ```{r, eval=TRUE}
 threshold_counts <- 20
@@ -488,30 +417,109 @@ Some candidates were also removed, because upon visual inspection, the detected 
 Some of the detected bona-fide TSSs seem to belong to novel, unannotated transcripts (presumed ncRNAs). These are, of course, not included in the Li TSS list.
 
 ```{r, eval=TRUE}
+threshold_enrichment <- 3
+
 exp.curated <- read.delim('exp_temp.manually_curated.txt', sep = '\t', header = FALSE)
 stat.curated <- read.delim('stat_temp.manually_curated.txt', sep = '\t', header = FALSE)
 
-
-gff.ms1 <- import.gff3('./genome/Ms1.gff')
+TSS.bed <- import.bed(paste0(genome_dir, 'TSS_Li.bed'))
+TSS.bed <- TSS.bed[TSS.bed$name %in% exp.curated[, 1] | TSS.bed$name %in% stat.curated[, 1], ]
 
 bam <- BamFileList(list.files('./BAM/', 
                               pattern = '\\.bam$', 
                               full.names = TRUE),
                    asMates = FALSE,
                    yieldSize = 1000000)
-se <- summarizeOverlaps(features = gff.ms1,
-                        reads = bam,
-                        mode = 'Union',
-                        singleEnd = TRUE,
-                        ignore.strand = FALSE)
+se.TSS <- summarizeOverlaps(features = TSS.bed,
+                            reads = bam,
+                            mode = 'Union',
+                            singleEnd = TRUE,
+                            ignore.strand = FALSE)
 sampleInfo <- data.frame(t(read.csv('sampleInfo', sep = '\t', header = FALSE)))
 colnames(sampleInfo) <- c('run', 'treatment', 'file', 'phase')
-colData(se) <- cbind(colData(se), sampleInfo) # must use cbind; direct assignment ('=') does not work
-colnames(se) <- paste(se$treatment, se$phase, se$run, sep = '_')
-counts <- assay(se)
-counts <- counts[, sort(colnames(counts))]
+colData(se.TSS) <- cbind(colData(se.TSS), sampleInfo) # must use cbind; direct assignment ('=') does not work
+colnames(se.TSS) <- paste(se.TSS$treatment, se.TSS$phase, se.TSS$run, sep = '_')
+counts.TSS <- assay(se.TSS)
+counts.TSS <- counts.TSS[, sort(colnames(counts.TSS))]
+rownames(counts.TSS) <- TSS.bed$name
+
+
+
+mapped_stats <- read.delim('mapped_stats', stringsAsFactors = FALSE, header = FALSE, sep = '\t')
+mapped_stats[, 3] <- colnames(se.TSS)
+mapped_stats <- mapped_stats[order(mapped_stats[, 3]), ]
+
+counts.TSS.lib_norm <- counts.TSS
+for (i in 1:ncol(counts.TSS)){
+  counts.TSS.lib_norm[, i] <- counts.TSS[, i] / mapped_stats[i, 2] * 1000000
+}
+counts.TSS.lib_norm.pool <- cbind(rowSums(counts.TSS.lib_norm[, 1:3]), 
+                                  rowSums(counts.TSS.lib_norm[, 4:6]), 
+                                  rowSums(counts.TSS.lib_norm[, 7:9]),
+                                  rowSums(counts.TSS.lib_norm[, 10:12]))
+colnames(counts.TSS.lib_norm.pool) <- c('ADPRC_EXP', 'ADPRC_STAT', 'mock_EXP', 'mock_STAT')
+counts.TSS.lib_norm.pool.ctrl_norm <- cbind(counts.TSS.lib_norm.pool[, 1] / counts.TSS.lib_norm.pool[, 3],
+                                            counts.TSS.lib_norm.pool[, 2] / counts.TSS.lib_norm.pool[, 4])
+colnames(counts.TSS.lib_norm.pool.ctrl_norm) <- c('EXP', 'STAT')
+
+
+exp.TSS <- counts.TSS.lib_norm.pool.ctrl_norm[rownames(counts.TSS.lib_norm.pool.ctrl_norm) %in%
+                                                exp.curated[, 1], ]
+exp.TSS <- exp.TSS[exp.TSS[, 1] >= threshold_enrichment, 1]
+write.table(c(gene = 'TSS_enrichment', exp.TSS), file = 'EXP.final.txt', quote = FALSE, sep = '\t', col.names = FALSE)
+
+stat.TSS <- counts.TSS.lib_norm.pool.ctrl_norm[rownames(counts.TSS.lib_norm.pool.ctrl_norm) %in%
+                                                 stat.curated[, 1], ]
+stat.TSS <- stat.TSS[stat.TSS[, 2] >= threshold_enrichment & !is.na(stat.TSS[, 2]), 2]
+write.table(c(gene = 'TSS_enrichment', stat.TSS), file = 'STAT.final.txt', quote = FALSE, sep = '\t', col.names = FALSE)
 ```
 
+Three novel ncRNAs were identified in the sequencing data and their TSS were curated manually.
+These ncRNAs will be now tested for enrichment in the ADPRC+ samples.
+
+```{r, eval=TRUE}
+ncRNAs <- read.delim('novel_ncRNAs.manually_curated.txt', sep = '\t', header = FALSE)
+
+TSS_ncRNAs.bed <- import.bed(paste0(genome_dir, 'TSS_novel_ncRNAs.bed'))
+
+bam <- BamFileList(list.files('./BAM/', 
+                              pattern = '\\.bam$', 
+                              full.names = TRUE),
+                   asMates = FALSE,
+                   yieldSize = 1000000)
+se_ncRNAs.TSS <- summarizeOverlaps(features = TSS_ncRNAs.bed,
+                                   reads = bam,
+                                   mode = 'Union',
+                                   singleEnd = TRUE,
+                                   ignore.strand = FALSE)
+sampleInfo <- data.frame(t(read.csv('sampleInfo', sep = '\t', header = FALSE)))
+colnames(sampleInfo) <- c('run', 'treatment', 'file', 'phase')
+colData(se_ncRNAs.TSS) <- cbind(colData(se_ncRNAs.TSS), sampleInfo) # must use cbind; direct assignment ('=') does not work
+colnames(se_ncRNAs.TSS) <- paste(se_ncRNAs.TSS$treatment, se_ncRNAs.TSS$phase, se_ncRNAs.TSS$run, sep = '_')
+counts_ncRNAs.TSS <- assay(se_ncRNAs.TSS)
+counts_ncRNAs.TSS <- counts_ncRNAs.TSS[, sort(colnames(counts_ncRNAs.TSS))]
+rownames(counts_ncRNAs.TSS) <- TSS_ncRNAs.bed$name
+
+
+mapped_stats <- read.delim('mapped_stats', stringsAsFactors = FALSE, header = FALSE, sep = '\t')
+mapped_stats[, 3] <- colnames(se_ncRNAs.TSS)
+mapped_stats <- mapped_stats[order(mapped_stats[, 3]), ]
+
+counts_ncRNAs.TSS.lib_norm <- counts_ncRNAs.TSS
+for (i in 1:ncol(counts_ncRNAs.TSS)){
+  counts_ncRNAs.TSS.lib_norm[, i] <- counts_ncRNAs.TSS[, i] / mapped_stats[i, 2] * 1000000
+}
+counts_ncRNAs.TSS.lib_norm.pool <- cbind(rowSums(counts_ncRNAs.TSS.lib_norm[, 1:3]), 
+                                         rowSums(counts_ncRNAs.TSS.lib_norm[, 4:6]), 
+                                         rowSums(counts_ncRNAs.TSS.lib_norm[, 7:9]),
+                                         rowSums(counts_ncRNAs.TSS.lib_norm[, 10:12]))
+colnames(counts_ncRNAs.TSS.lib_norm.pool) <- c('ADPRC_EXP', 'ADPRC_STAT', 'mock_EXP', 'mock_STAT')
+counts_ncRNAs.TSS.lib_norm.pool.ctrl_norm <- cbind(counts_ncRNAs.TSS.lib_norm.pool[, 1] / counts_ncRNAs.TSS.lib_norm.pool[, 3],
+                                                   counts_ncRNAs.TSS.lib_norm.pool[, 2] / counts_ncRNAs.TSS.lib_norm.pool[, 4])
+colnames(counts_ncRNAs.TSS.lib_norm.pool.ctrl_norm) <- c('EXP', 'STAT')
+
+write.csv(counts_ncRNAs.TSS.lib_norm.pool.ctrl_norm, file = 'novel_ncRNAs_TSS_enrichment.csv', quote = FALSE)
+```
 
 
 ***
